@@ -6,12 +6,13 @@
 #
 # Execution order is optimized for Web Terminal reliability:
 #   Steps 1-5  — Core configuration (safe, no network disruption)
+#   Step 5b    — Accelerator recording rules (GPU Operator prerequisite only)
 #   Step 6     — Operator install (may briefly disrupt Web Terminal)
 #   Step 7     — Post-operator setup (DSCI monitoring, UIPlugins, CRs)
 #   Step 8     — Dashboard restart (picks up everything)
 #   Step 9     — Verification (best effort)
 #
-# Steps 1-5 complete before any network disruption caused by RHCL/Service
+# Steps 1-5b complete before any network disruption caused by RHCL/Service
 # Mesh installation. If the terminal disconnects during Step 6, operators
 # continue installing via OLM in the background. Re-run the script to
 # pick up where it left off — all steps are idempotent.
@@ -55,8 +56,8 @@ echo "=============================================="
 echo " RHOAI 3.5 SNO — Enable All Features"
 echo "=============================================="
 echo ""
-info "Order: Config (1-5) → Operators (6) → Post-op (7) → Restart (8) → Verify (9)"
-info "Steps 1-5 complete before any network disruption."
+info "Order: Config (1-5b) → Operators (6) → Post-op (7) → Restart (8) → Verify (9)"
+info "Steps 1-5b complete before any network disruption."
 echo ""
 
 ###############################################################################
@@ -790,8 +791,80 @@ oc patch odhdashboardconfig odh-dashboard-config \
 success "Dashboard menu patched"
 echo ""
 
+###############################################################################
+# Step 5b: Accelerator metrics recording rules
+#   GPU Operator is a prerequisite (already installed). This step creates
+#   PrometheusRules that convert DCGM_FI_* metrics into accelerator_*
+#   format expected by RHOAI Observe & Monitor dashboards.
+#   Without these, GPU utilization panels show "No data".
+#   Safe to run here — no dependency on Step 6 operators.
+###############################################################################
+if oc get prometheusrule nvidia-gpu-operator-metrics -n nvidia-gpu-operator &>/dev/null 2>&1; then
+    info "Configuring accelerator metrics recording rules..."
+    oc apply -f - <<'EOF'
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: accelerator-recording-rules
+  namespace: nvidia-gpu-operator
+  labels:
+    app: nvidia-gpu-operator
+spec:
+  groups:
+  - name: accelerator.rules
+    interval: 30s
+    rules:
+    - record: accelerator_gpu_utilization
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_GPU_UTIL,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_memory_used_bytes
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_FB_USED * 1024 * 1024,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_memory_total_bytes
+      expr: |
+        label_replace(
+          (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) * 1024 * 1024,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_memory_clock_hertz
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_MEM_CLOCK * 1e6,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_sm_clock_hertz
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_SM_CLOCK * 1e6,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_power_usage_watts
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_POWER_USAGE,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_temperature_celsius
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_GPU_TEMP,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+EOF
+    success "Accelerator metrics recording rules created"
+else
+    info "GPU Operator not installed — accelerator recording rules skipped"
+fi
+echo ""
+
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-success "Core configuration complete (Steps 1-5)."
+success "Core configuration complete (Steps 1-5b)."
 info "Next: operator install (Step 6) may briefly disrupt Web Terminal."
 info "If disconnected, re-run this script — completed steps are skipped."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -1271,6 +1344,94 @@ if $COO_OK; then
     done
     [ "${MON_STATUS:-}" != "True" ] && warn "MonitoringStack not ready yet (will reconcile in background)"
 
+    # DCGM metrics for RHOAI MonitoringStack Prometheus
+    # The RHOAI MonitoringStack Prometheus only scrapes its own namespace by
+    # default. Without this ServiceMonitor, the "LLM Utilization" tab in
+    # Observe & Monitor shows no GPU data (it uses data-science-prometheus-
+    # datasource, NOT the cluster Prometheus).
+    # The recording rule converts DCGM_FI_* → accelerator_* within this Prometheus.
+    if oc get prometheusrule nvidia-gpu-operator-metrics -n nvidia-gpu-operator &>/dev/null 2>&1; then
+        info "Configuring DCGM metrics for RHOAI MonitoringStack..."
+        oc apply -f - <<'DCGMEOF'
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nvidia-dcgm-exporter
+  namespace: redhat-ods-monitoring
+  labels:
+    app: nvidia-dcgm-exporter
+spec:
+  endpoints:
+  - path: /metrics
+    port: gpu-metrics
+  jobLabel: app
+  namespaceSelector:
+    matchNames:
+    - nvidia-gpu-operator
+  selector:
+    matchLabels:
+      app: nvidia-dcgm-exporter
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: accelerator-recording-rules
+  namespace: redhat-ods-monitoring
+  labels:
+    app: nvidia-gpu-operator
+spec:
+  groups:
+  - name: accelerator.rules
+    interval: 30s
+    rules:
+    - record: accelerator_gpu_utilization
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_GPU_UTIL,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_memory_used_bytes
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_FB_USED * 1024 * 1024,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_memory_total_bytes
+      expr: |
+        label_replace(
+          (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) * 1024 * 1024,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_memory_clock_hertz
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_MEM_CLOCK * 1e6,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_sm_clock_hertz
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_SM_CLOCK * 1e6,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_power_usage_watts
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_POWER_USAGE,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_temperature_celsius
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_GPU_TEMP,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+DCGMEOF
+        success "DCGM ServiceMonitor + recording rules created in redhat-ods-monitoring"
+    else
+        info "GPU Operator not installed — DCGM metrics for RHOAI monitoring skipped"
+    fi
+
     # Wait for Perses
     info "Waiting for Perses..."
     PERSES_STATUS=""
@@ -1282,6 +1443,28 @@ if $COO_OK; then
         sleep 10; WAIT=$((WAIT + 10))
     done
     [ "${PERSES_STATUS:-}" != "True" ] && warn "Perses not ready yet (will reconcile in background)"
+fi
+
+# Patch openshift-ai-inference Gateway to allow all DS project namespaces
+# KServe creates this gateway with a hard-coded namespace list. Without this
+# patch, vLLM InferenceService / LLMInferenceService deployments in new DS
+# projects fail with "NotAllowedByListeners". Using the opendatahub.io/dashboard
+# label means any DS project created via the dashboard is automatically allowed.
+if oc get gateway openshift-ai-inference -n openshift-ingress &>/dev/null; then
+    info "Patching openshift-ai-inference gateway for DS project access..."
+    oc label ns openshift-ingress opendatahub.io/dashboard=true --overwrite 2>/dev/null || true
+    oc label ns redhat-ods-applications opendatahub.io/dashboard=true --overwrite 2>/dev/null || true
+    oc patch gateway openshift-ai-inference -n openshift-ingress --type='json' -p='[
+      {"op":"replace","path":"/spec/listeners/0/allowedRoutes/namespaces","value":{
+        "from":"Selector",
+        "selector":{
+          "matchLabels":{
+            "opendatahub.io/dashboard":"true"
+          }
+        }
+      }}
+    ]' 2>/dev/null && success "Inference gateway: all DS projects allowed" \
+                   || warn "Could not patch inference gateway"
 fi
 echo ""
 
